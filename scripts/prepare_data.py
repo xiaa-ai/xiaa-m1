@@ -23,6 +23,9 @@ SYSTEM_PROMPT = "You are Xiaa, a helpful AI assistant made by Xiaa AI."
 TOKENIZER_CORPUS_FINEWEB_DOCS = 2_000_000
 TOKENIZER_CORPUS_BN_DOCS = 1_000_000
 TOKENIZER_CORPUS_HI_DOCS = 1_000_000
+SANGRAHA_BENGALI_LANGUAGE = "ben_Beng"
+SANGRAHA_HINDI_LANGUAGE = "hin_Deva"
+ENGLISH_CORPUS_REUSE_THRESHOLD_BYTES = 100 * 1024 * 1024
 
 PRETRAIN_FINEWEB_TOKENS = 8_000_000_000
 PRETRAIN_BN_TOKENS = 1_000_000_000
@@ -94,23 +97,65 @@ def stream_fineweb() -> Iterable[dict[str, Any]]:
 	)
 
 
-def stream_indiccorp(language: str) -> Iterable[dict[str, Any]]:
-	"""Return a streaming iterator over IndicCorp for a given language."""
-	attempts: list[tuple[tuple[Any, ...], dict[str, Any]]] = [
-		(("ai4bharat/IndicCorp",), {"split": "train", "streaming": True, "language": language}),
-		(("ai4bharat/IndicCorp", language), {"split": "train", "streaming": True}),
-	]
+def extract_ultrachat_messages_text(record: dict[str, Any]) -> str:
+	"""Extract flattened text from UltraChat messages for fallback corpora."""
+	messages = record.get("messages")
+	if isinstance(messages, list):
+		chunks: list[str] = []
+		for message in messages:
+			if not isinstance(message, dict):
+				continue
+			content = normalize_text(
+				str(message.get("content") or message.get("text") or message.get("value") or "")
+			).strip()
+			if content:
+				chunks.append(content)
+		if chunks:
+			return " ".join(chunks)
+	return extract_record_text(record)
 
-	last_error: Exception | None = None
-	for args, kwargs in attempts:
-		try:
-			return load_dataset(*args, **kwargs)
-		except Exception as exc:  # pragma: no cover - depends on remote dataset configs
-			last_error = exc
 
-	raise RuntimeError(
-		f"Unable to load IndicCorp for language '{language}'. Last error: {last_error}"
-	)
+def stream_ultrachat_indic_fallback(language: str) -> Iterable[dict[str, Any]]:
+	"""Return UltraChat stream used when Sangraha is unavailable."""
+	try:
+		stream = load_dataset(
+			"HuggingFaceH4/ultrachat_200k",
+			split="train_sft",
+			streaming=True,
+		)
+	except Exception as exc:  # pragma: no cover - depends on remote dataset availability
+		print(
+			"Fallback dataset load failed for "
+			f"{language}: {exc}. Continuing with empty fallback stream."
+		)
+		return iter(())
+
+	def generator() -> Iterator[dict[str, Any]]:
+		for record in stream:
+			text = extract_ultrachat_messages_text(record)
+			if text:
+				yield {"text": text}
+
+	return generator()
+
+
+def stream_sangraha(language: str) -> Iterable[dict[str, Any]]:
+	"""Return Sangraha stream for a language, with automatic fallback."""
+	try:
+		return load_dataset(
+			"ai4bharat/sangraha",
+			language,
+			split="train",
+			streaming=True,
+			trust_remote_code=True,
+		)
+	except Exception as exc:  # pragma: no cover - depends on remote dataset availability
+		print(f"ai4bharat/sangraha unavailable for {language}: {exc}")
+		print(
+			"Falling back to HuggingFaceH4/ultrachat_200k train_sft "
+			"and extracting text from messages."
+		)
+		return stream_ultrachat_indic_fallback(language)
 
 
 def write_limited_documents(
@@ -140,25 +185,57 @@ def write_limited_documents(
 def prepare_tokenizer_corpus(corpus_path: Path) -> None:
 	"""Build tokenizer corpus text file from multilingual sources."""
 	print("Step 1/3: Preparing tokenizer corpus...")
-	with corpus_path.open("w", encoding="utf-8") as handle:
-		write_limited_documents(
-			dataset_stream=stream_fineweb(),
-			output_file=handle,
-			limit=TOKENIZER_CORPUS_FINEWEB_DOCS,
-			source_name="fineweb-edu",
-		)
-		write_limited_documents(
-			dataset_stream=stream_indiccorp("bn"),
-			output_file=handle,
-			limit=TOKENIZER_CORPUS_BN_DOCS,
-			source_name="indiccorp-bn",
-		)
-		write_limited_documents(
-			dataset_stream=stream_indiccorp("hi"),
-			output_file=handle,
-			limit=TOKENIZER_CORPUS_HI_DOCS,
-			source_name="indiccorp-hi",
-		)
+	skip_english = (
+		corpus_path.exists()
+		and corpus_path.stat().st_size > ENGLISH_CORPUS_REUSE_THRESHOLD_BYTES
+	)
+
+	file_mode = "a" if skip_english else "w"
+	with corpus_path.open(file_mode, encoding="utf-8") as handle:
+		if skip_english:
+			print(
+				"Existing tokenizer corpus is >100MB. "
+				"Skipping FineWeb English section and appending Indic data only."
+			)
+		else:
+			write_limited_documents(
+				dataset_stream=stream_fineweb(),
+				output_file=handle,
+				limit=TOKENIZER_CORPUS_FINEWEB_DOCS,
+				source_name="fineweb-edu",
+			)
+
+		try:
+			write_limited_documents(
+				dataset_stream=stream_sangraha(SANGRAHA_BENGALI_LANGUAGE),
+				output_file=handle,
+				limit=TOKENIZER_CORPUS_BN_DOCS,
+				source_name="sangraha-ben_Beng",
+			)
+			write_limited_documents(
+				dataset_stream=stream_sangraha(SANGRAHA_HINDI_LANGUAGE),
+				output_file=handle,
+				limit=TOKENIZER_CORPUS_HI_DOCS,
+				source_name="sangraha-hin_Deva",
+			)
+		except Exception as exc:
+			print(f"Sangraha Indic section failed: {exc}")
+			print(
+				"Falling back to HuggingFaceH4/ultrachat_200k train_sft "
+				"for Indic substitute corpus generation."
+			)
+			write_limited_documents(
+				dataset_stream=stream_ultrachat_indic_fallback(SANGRAHA_BENGALI_LANGUAGE),
+				output_file=handle,
+				limit=TOKENIZER_CORPUS_BN_DOCS,
+				source_name="ultrachat-fallback-ben_Beng",
+			)
+			write_limited_documents(
+				dataset_stream=stream_ultrachat_indic_fallback(SANGRAHA_HINDI_LANGUAGE),
+				output_file=handle,
+				limit=TOKENIZER_CORPUS_HI_DOCS,
+				source_name="ultrachat-fallback-hin_Deva",
+			)
 	print(f"Tokenizer corpus saved: {corpus_path}")
 
 
@@ -273,9 +350,43 @@ def prepare_pretraining_shards(shard_dir: Path, tokenizer: XiaaTokenizer) -> Non
 
 	sources: list[tuple[str, Iterable[dict[str, Any]], int]] = [
 		("fineweb-edu", stream_fineweb(), PRETRAIN_FINEWEB_TOKENS),
-		("indiccorp-bn", stream_indiccorp("bn"), PRETRAIN_BN_TOKENS),
-		("indiccorp-hi", stream_indiccorp("hi"), PRETRAIN_HI_TOKENS),
 	]
+
+	try:
+		sources.extend(
+			[
+				(
+					"sangraha-ben_Beng",
+					stream_sangraha(SANGRAHA_BENGALI_LANGUAGE),
+					PRETRAIN_BN_TOKENS,
+				),
+				(
+					"sangraha-hin_Deva",
+					stream_sangraha(SANGRAHA_HINDI_LANGUAGE),
+					PRETRAIN_HI_TOKENS,
+				),
+			]
+		)
+	except Exception as exc:
+		print(f"Sangraha pretraining stream setup failed: {exc}")
+		print(
+			"Falling back to HuggingFaceH4/ultrachat_200k train_sft "
+			"for Indic substitute pretraining streams."
+		)
+		sources.extend(
+			[
+				(
+					"ultrachat-fallback-ben_Beng",
+					stream_ultrachat_indic_fallback(SANGRAHA_BENGALI_LANGUAGE),
+					PRETRAIN_BN_TOKENS,
+				),
+				(
+					"ultrachat-fallback-hin_Deva",
+					stream_ultrachat_indic_fallback(SANGRAHA_HINDI_LANGUAGE),
+					PRETRAIN_HI_TOKENS,
+				),
+			]
+		)
 
 	for source_name, stream, token_budget in sources:
 		print(f"Tokenizing source: {source_name} (target {token_budget:,} tokens)")
